@@ -1,0 +1,16 @@
+
+compile		= "wrapper.c project.o randomwalk.o -lstdc++"
+
+mapwidth	= 650
+mapheight	= 400
+
+icontitle	= "%d"
+drawlinks	= true
+mapgrid		= 50
+
+wlan-probframecorrupt = 3;
+
+mobile PDAa { wlan { } }
+mobile PDAb { wlan { } }
+mobile PDAc { wlan { } }
+mobile PDAd { wlan { } }
