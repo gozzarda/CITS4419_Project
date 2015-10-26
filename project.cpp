@@ -10,13 +10,15 @@
 
 using namespace std;
 
-#define EV_TESTMSG	EV_TIMER6
-#define EV_TIMEOUT	EV_TIMER7
-#define	EV_TRANSMIT	EV_TIMER8
+#define EV_TIMEOUT EV_TIMER4
+#define EV_TESTMSG EV_TIMER5
+#define EV_TRANSMIT	EV_TIMER6
+#define EV_NETWORKREADY	EV_TIMER7
+#define	EV_DATALINKREADY	EV_TIMER8
 #define	EV_WALKING	EV_TIMER9
 
 const string broadnicaddr = "ff:ff:ff:ff:ff:ff";
-const CnetTime acktime = 1000000;
+const CnetTime ack_timeout = 1000000;
 
 string get_local_nicaddr() {
 	string nic = "xx:xx:xx:xx:xx:xx";
@@ -49,11 +51,8 @@ struct DataFrame {
 	}
 	void decode(string frame) {
 		stringstream fs(frame);
-		char c;
-		src.clear();
-		while (fs.good() && (c = fs.get()) != delim) src += c;
-		dst.clear();
-		while (fs.good() && (c = fs.get()) != delim) dst += c;
+		getline(fs, src, delim);
+		getline(fs, dst, delim);
 		body.clear();
 		while (fs.good()) {
 			string line;
@@ -67,15 +66,15 @@ struct DataFrame {
 struct NetFrame {
 	const char delim = '/';
 	string src = broadnicaddr;
-	int seq;
+	int seq = 0;
 	string dst = broadnicaddr;
 	string type = "MESSAGE";
 	int hops = 16;
 	string body;
 	NetFrame() {}
-	NetFrame(int seq, string body) : src(get_local_nicaddr()), seq(seq), body(body) {}
-	NetFrame(int seq, string dst, string body) : src(get_local_nicaddr()), seq(seq), dst(dst), body(body) {}
-	NetFrame(int seq, string dst, string type, string body) : src(get_local_nicaddr()), seq(seq), dst(dst), type(type), body(body) {}
+	NetFrame(string body) : src(get_local_nicaddr()), seq(seq), body(body) {}
+	NetFrame(string dst, string body) : src(get_local_nicaddr()), seq(seq), dst(dst), body(body) {}
+	NetFrame(string dst, string type, string body) : src(get_local_nicaddr()), seq(seq), dst(dst), type(type), body(body) {}
 	NetFrame& operator=(const NetFrame& rhs) {
 		src = rhs.src;
 		seq = rhs.seq;
@@ -97,16 +96,12 @@ struct NetFrame {
 	}
 	void decode(string frame) {
 		stringstream fs(frame);
-		char c;
-		src.clear();
-		while (fs.good() && (c = fs.get()) != delim) src += c;
+		getline(fs, src, delim);
 		fs >> seq;
 		while (fs.good())
 			if (fs.get() == delim) break;
-		dst.clear();
-		while (fs.good() && (c = fs.get()) != delim) dst += c;
-		type.clear();
-		while (fs.good() && (c = fs.get()) != delim) type += c;
+		getline(fs, dst, delim);
+		getline(fs, type, delim);
 		fs >> hops;
 		while (fs.good())
 			if (fs.get() == delim) break;
@@ -120,63 +115,134 @@ struct NetFrame {
 };
 
 int sequence_number;
-queue<NetFrame> * msgstosend;
-map<int, NetFrame> * sentmsgs;
-queue<pair<CnetTime, int>> * sendtime;
+set<string> * neighbours;
 map<string, set<string>> * routes;
-map<int, string> * routeused;
+queue<NetFrame> * transmit_queue;
+map<int, NetFrame> * sent_messages;
+queue<pair<CnetTime, int>> * sent_time;
+map<int, string> * route_used;
+queue<string> * datalink_queue;
+queue<string> * network_queue;
 
 EVENT_HANDLER(transmit) {
-	if (msgstosend->empty()) return;
+	if (transmit_queue->empty()) return;
 
-	if (nodeinfo.nodenumber == 2) {
-		cerr << "2: routes = " << endl;
-		for (auto & kv : *routes) {
-			cerr << "\t" << kv.first << "  : ";
-			for (auto el : kv.second) {
-				cerr << " " << el;
-			}
-			cerr << endl;
-		}
-	}
-
-	NetFrame msg = msgstosend->front();
+	NetFrame msg = transmit_queue->front();
+	transmit_queue->pop();
 	DataFrame frame;
 	if (msg.dst != broadnicaddr && (routes->count(msg.dst) == 0 || routes->at(msg.dst).empty())) {
-		NetFrame nfr(sequence_number++, broadnicaddr, "FULL_REVERSAL", msg.dst);
-		frame = DataFrame(nfr.encode());
+		transmit_queue->push(msg);
+		if (neighbours->size() == 0) {
+			NetFrame nfr(broadnicaddr, "SOUND_OFF", "");
+			frame = DataFrame(nfr.encode());
+			CNET_start_timer(EV_TRANSMIT, 1000, data);	// Schedule retransmission attempt
+		} else {
+			if (routes->count(msg.dst) == 0)
+				routes->emplace(msg.dst, *neighbours);
+			else
+				routes->at(msg.dst) = *neighbours;
+			NetFrame nfr(broadnicaddr, "FULL_REVERSAL", msg.dst);
+			frame = DataFrame(nfr.encode());
+			CNET_start_timer(EV_TRANSMIT, 10000, data);	// Schedule retransmission attempt
+		}
 	} else {
-		msgstosend->pop();
-		msg.seq = sequence_number++;
 		if (msg.dst == broadnicaddr || routes->at(msg.dst).count(msg.dst))
 			frame = DataFrame(msg.dst, msg.encode());
 		else
 			frame = DataFrame(*(routes->at(msg.dst).begin()), msg.encode());
-		sentmsgs->emplace(msg.seq, msg);
-		routeused->emplace(msg.seq, frame.dst);
-		sendtime->push(pair<CnetTime, int>(nodeinfo.time_in_usec, msg.seq));
-		CNET_start_timer(EV_TIMEOUT, acktime, data);
+		if (msg.src == get_local_nicaddr() && msg.type == "MESSAGE") {
+			sent_messages->emplace(msg.seq, msg);
+			route_used->emplace(msg.seq, frame.dst);
+			sent_time->push(pair<CnetTime, int>(nodeinfo.time_in_usec, msg.seq));
+		}
+		CNET_start_timer(EV_TIMEOUT, ack_timeout, data);
 	}
 	string framestr = frame.encode();
 	size_t len = framestr.size();
 	CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
-	CNET_start_timer(EV_TRANSMIT, 1000, data);
 }
 
 EVENT_HANDLER(timeout) {
-	while (!(sendtime->empty()) && sendtime->front().first + acktime <= nodeinfo.time_in_usec) {
-		if (sentmsgs->count(sendtime->front().second)) {
-			msgstosend->push(sentmsgs->at(sendtime->front().second));
-			routes->at(sentmsgs->at(sendtime->front().second).dst).erase(routeused->at(sendtime->front().second));
-			sentmsgs->erase(sendtime->front().second);
-			routeused->erase(sendtime->front().second);
+	while (!(sent_time->empty()) && sent_time->front().first + ack_timeout <= nodeinfo.time_in_usec) {
+		int seq = sent_time->front().second;
+		sent_time->pop();
+		if (sent_messages->count(seq)) {
+			NetFrame msg = sent_messages->at(seq);
+			sent_messages->erase(seq);
+			transmit_queue->push(msg);
 			CNET_start_timer(EV_TRANSMIT, 1, data);
+			routes->at(msg.dst).erase(route_used->at(seq));
+			route_used->erase(seq);
 		}
-		sendtime->pop();
 	}
 }
 
-EVENT_HANDLER(receive) {
+EVENT_HANDLER(network_ready) {
+	string message = network_queue->front();
+	network_queue->pop();
+	cout << nodeinfo.nodenumber << ": RECEIVED MESSAGE: " << message << endl;
+}
+
+EVENT_HANDLER(datalink_ready) {
+	string dframestr = datalink_queue->front();
+	datalink_queue->pop();
+	NetFrame nfr;
+	nfr.decode(dframestr);
+	--nfr.hops;
+	if (nfr.dst == broadnicaddr || nfr.dst == get_local_nicaddr()) {
+		if (nfr.type == "ACK") {
+			cout << nodeinfo.nodenumber << ": RECEIVED ACK" << endl;
+			sent_messages->erase(nfr.seq);
+		} else if (nfr.type == "NACK") {
+			if (sent_messages->count(nfr.seq)) {
+				routes->at(sent_messages->at(nfr.seq).dst).erase(route_used->at(nfr.seq));
+				route_used->erase(nfr.seq);
+				NetFrame msg = sent_messages->at(nfr.seq);
+				msg.seq = sequence_number++;
+				transmit_queue->push(msg);
+				sent_messages->erase(nfr.seq);
+			}
+		} else if (nfr.type == "FULL_REVERSAL") {
+			if (routes->count(nfr.body))
+				routes->at(nfr.body).erase(nfr.src);
+			if (nfr.body != get_local_nicaddr() && (routes->count(nfr.body) == 0 || routes->at(nfr.body).empty())) {
+				NetFrame response = NetFrame(broadnicaddr, "FULL_REVERSAL", nfr.body);
+				DataFrame frame(response.encode());
+				string framestr = frame.encode();
+				size_t len = framestr.size();
+				CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
+			}
+		} else if (nfr.type == "SOUND_OFF") {
+			NetFrame response = NetFrame(broadnicaddr, "ONE_TWO", "");
+			DataFrame frame(response.encode());
+			string framestr = frame.encode();
+			size_t len = framestr.size();
+			CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
+		} else if (nfr.type == "MESSAGE") {
+			network_queue->push(nfr.body);
+			CNET_start_timer(EV_NETWORKREADY, 1, data);
+			NetFrame ack(nfr.src, "ACK", "");
+			ack.seq = nfr.seq;
+			transmit_queue->push(ack);
+			CNET_start_timer(EV_TRANSMIT, 1, data);
+		}
+	} else {
+		if (nfr.hops > 0) {
+			nfr.body += ", " + to_string(nodeinfo.nodenumber);
+			transmit_queue->push(nfr);
+			CNET_start_timer(EV_TRANSMIT, 1, data);
+		} else {
+			NetFrame nack(nfr.src, "NACK", "");
+			nack.seq = nfr.seq;
+			DataFrame frame(nack.encode());
+			string framestr = frame.encode();
+			size_t len = framestr.size();
+			CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
+		}
+	}
+}
+
+EVENT_HANDLER(physical_ready) {
 	string buf(linkinfo[1].mtu, 'X');
 	size_t	len	= buf.size();
 	int		link;
@@ -187,80 +253,43 @@ EVENT_HANDLER(receive) {
 	DataFrame dfr;
 	dfr.decode(buf);
 
+	neighbours->insert(dfr.src);
+	if (routes->count(dfr.src) == 0)
+		routes->emplace(dfr.src, set<string>());
+	routes->at(dfr.src).insert(dfr.src);
+
 	if (dfr.dst == broadnicaddr || dfr.dst == get_local_nicaddr()) {
-		NetFrame nfr;
-		nfr.decode(dfr.body);
-		--nfr.hops;
-		if (nfr.dst == broadnicaddr || nfr.dst == get_local_nicaddr()) {
-			if (nfr.type == "ACK") {
-				sentmsgs->erase(nfr.seq);
-			} else if (nfr.type == "NACK") {
-				if (sentmsgs->count(nfr.seq)) {
-					routes->at(sentmsgs->at(nfr.seq).dst).erase(routeused->at(nfr.seq));
-					routeused->erase(nfr.seq);
-					msgstosend->push(sentmsgs->at(nfr.seq));
-					sentmsgs->erase(nfr.seq);
-				}
-			} else if (nfr.type == "FULL_REVERSAL") {
-				if (routes->count(nfr.body)) routes->at(nfr.body).erase(nfr.src);
-				NetFrame response;
-				//cerr << nodeinfo.nodenumber << ": Received FULL_REVERSAL (" << nfr.body << ") from " << nfr.src << ". Response: ";
-				if ((routes->count(nfr.body) && !(routes->at(nfr.body).empty())) || nfr.body == get_local_nicaddr()) {
-					response = NetFrame(0, broadnicaddr, "ROUTE_ANNOUNCE", nfr.body);
-					//cerr << "ROUTE_ANNOUNCE" << endl;
-				} else {
-					response = NetFrame(0, broadnicaddr, "FULL_REVERSAL", nfr.body);
-					//cerr << "FULL_REVERSAL" << endl;
-				}
-				DataFrame frame(response.encode());
-				string framestr = frame.encode();
-				size_t len = framestr.size();
-				CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
-			} else if (nfr.type == "ROUTE_ANNOUNCE") {
-				if (routes->count(nfr.body) == 0) routes->emplace(nfr.body, set<string>());
-				routes->at(nfr.body).insert(nfr.src);
-			} else if (nfr.type == "MESSAGE") {
-				cout << "\t" << nodeinfo.nodenumber << ": Received message from " << nfr.src << ", message reads: " << nfr.body << endl;
-				NetFrame ack(nfr.seq, nfr.src, "ACK", "");
-				DataFrame frame(ack.encode());
-				string framestr = frame.encode();
-				size_t len = framestr.size();
-				CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
-			}
-		} else {
-			if (nfr.hops > 0) {
-				msgstosend->push(nfr);
-				CNET_start_timer(EV_TRANSMIT, 1000000, data);
-			} else {
-				NetFrame nack(nfr.seq, nfr.src, "NACK", "");
-				DataFrame frame(nack.encode());
-				string framestr = frame.encode();
-				size_t len = framestr.size();
-				CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
-			}
-		}
+		datalink_queue->push(dfr.body);
+		CNET_start_timer(EV_DATALINKREADY, 1, data);
 	}
 }
 
+int message_number = 0;
 EVENT_HANDLER(testmsg) {
-	static int msg_num = 0;
-	msgstosend->push(NetFrame(0, "01:00:00:00:00:01", "This is test message " + to_string(msg_num++) + " from node " + to_string(nodeinfo.nodenumber)));
+	NetFrame msg("01:00:00:00:00:01", "This is test message " + to_string(++message_number) + " from 2 to 0");
+	msg.seq = sequence_number++;
+	transmit_queue->push(msg);
 	CNET_start_timer(EV_TRANSMIT, 1, data);
-	CNET_start_timer(EV_TESTMSG, 100000, data);
+	CNET_start_timer(EV_TESTMSG, 1000000, data);
 }
 
 EVENT_HANDLER(reboot_node) {
-	msgstosend = new queue<NetFrame>();
-	sentmsgs = new map<int, NetFrame>();
-	sendtime = new queue<pair<CnetTime, int>>;
+	sequence_number = 1;
+	neighbours = new set<string>;
 	routes = new map<string, set<string>>;
-	routeused = new map<int, string>();
+	transmit_queue = new queue<NetFrame>;
+	sent_messages = new map<int, NetFrame>;
+	sent_time = new queue<pair<CnetTime, int>>;
+	route_used = new map<int, string>;
+	datalink_queue = new queue<string>;
+	network_queue = new queue<string>;
 
 	CNET_check_version(CNET_VERSION);
 	CNET_srand(nodeinfo.time_of_day.sec + nodeinfo.nodenumber);
 
-	sequence_number = 0;
-	CHECK(CNET_set_handler(EV_PHYSICALREADY, receive, 0));
+	CHECK(CNET_set_handler(EV_PHYSICALREADY, physical_ready, 0));
+	CHECK(CNET_set_handler(EV_DATALINKREADY, datalink_ready, 0));
+	CHECK(CNET_set_handler(EV_NETWORKREADY, network_ready, 0));
 	CHECK(CNET_set_handler(EV_TRANSMIT, transmit, 0));
 	CHECK(CNET_set_handler(EV_TIMEOUT, timeout, 0));
 	CHECK(CNET_set_handler(EV_TESTMSG, testmsg, 0));
@@ -270,6 +299,6 @@ EVENT_HANDLER(reboot_node) {
 		start_walking();
 	}
 	if(nodeinfo.nodenumber == 2) {
-		CNET_start_timer(EV_TESTMSG, 1, 0);
+		CNET_start_timer(EV_TESTMSG, 1000000, 0);
 	}
 }
