@@ -10,15 +10,19 @@
 
 using namespace std;
 
-#define EV_TIMEOUT EV_TIMER4
-#define EV_TESTMSG EV_TIMER5
-#define EV_TRANSMIT	EV_TIMER6
-#define EV_NETWORKREADY	EV_TIMER7
+#define EV_TESTMSG			EV_TIMER1
+#define EV_HEARTBEAT		EV_TIMER2
+#define EV_NETWORKSEND		EV_TIMER3
+#define EV_NETWORKTIMEOUT	EV_TIMER4
+#define EV_DATALINKSEND		EV_TIMER5
+#define EV_DATALINKTIMEOUT	EV_TIMER6
+#define EV_NETWORKREADY		EV_TIMER7
 #define	EV_DATALINKREADY	EV_TIMER8
-#define	EV_WALKING	EV_TIMER9
+#define	EV_WALKING			EV_TIMER9
 
-const string broadnicaddr = "ff:ff:ff:ff:ff:ff";
-const CnetTime ack_timeout = 1000000;
+const string broadcastaddr = "ff:ff:ff:ff:ff:ff";
+const CnetTime datalink_acktime = 1000;
+const CnetTime network_acktime = 1000000;
 
 string get_local_nicaddr() {
 	string nic = "xx:xx:xx:xx:xx:xx";
@@ -26,33 +30,44 @@ string get_local_nicaddr() {
 	return nic;
 }
 
-// src/dst/body
-struct DataFrame {
+// src/seq/dst/type/body
+unsigned int datalink_sequence_number;
+struct DataLinkFrame {
 	const char delim = '/';
-	string src = broadnicaddr;
-	string dst = broadnicaddr;
+	string src;
+	unsigned int seq;
+	string dst;
+	string type;
 	string body;
-	DataFrame() {}
-	DataFrame(string body) : src(get_local_nicaddr()), body(body) {}
-	DataFrame(string dst, string body) : src(get_local_nicaddr()), dst(dst), body(body) {}
-	DataFrame& operator=(const DataFrame& rhs) {
+	DataLinkFrame(string dst, string type, string body) : src(get_local_nicaddr()), seq(datalink_sequence_number++), dst(dst), type(type), body(body) {}
+	DataLinkFrame(string dst, string body) : DataLinkFrame(dst, "CONTENT", body) {}
+	DataLinkFrame(string body) : DataLinkFrame(broadcastaddr, body) {}
+	DataLinkFrame() : DataLinkFrame("") {}
+	DataLinkFrame& operator=(const DataLinkFrame& rhs) {
 		src = rhs.src;
+		seq = rhs.seq;
 		dst = rhs.dst;
+		type = rhs.type;
 		body = rhs.body;
 		return *this;
 	}
 	string encode() {
 		string frame;
 		frame += src + delim;
+		frame += to_string(seq) + delim;
 		frame += dst + delim;
+		frame += type + delim;
 		frame += body;
-		if (frame.size() > linkinfo[1].mtu) throw "DataFrame exceeds MTU";
 		return frame;
 	}
 	void decode(string frame) {
 		stringstream fs(frame);
 		getline(fs, src, delim);
+		fs >> seq;
+		while (fs.good())
+			if (fs.get() == delim) break;
 		getline(fs, dst, delim);
+		getline(fs, type, delim);
 		body.clear();
 		while (fs.good()) {
 			string line;
@@ -62,20 +77,22 @@ struct DataFrame {
 	}
 };
 
-// src/dst/type/hops/body
-struct NetFrame {
+// src/seq/dst/type/hops/body
+unsigned int network_sequence_number;
+struct NetworkFrame {
 	const char delim = '/';
-	string src = broadnicaddr;
-	int seq = 0;
-	string dst = broadnicaddr;
-	string type = "MESSAGE";
-	int hops = 16;
+	string src;
+	unsigned int seq;
+	string dst;
+	string type;
+	unsigned int hops;
 	string body;
-	NetFrame() {}
-	NetFrame(string body) : src(get_local_nicaddr()), seq(seq), body(body) {}
-	NetFrame(string dst, string body) : src(get_local_nicaddr()), seq(seq), dst(dst), body(body) {}
-	NetFrame(string dst, string type, string body) : src(get_local_nicaddr()), seq(seq), dst(dst), type(type), body(body) {}
-	NetFrame& operator=(const NetFrame& rhs) {
+	NetworkFrame(string dst, string type, int hops, string body) : src(get_local_nicaddr()), seq(network_sequence_number++), dst(dst), type(type), hops(hops), body(body) {}
+	NetworkFrame(string dst, string type, string body) : NetworkFrame(dst, type, 16, body) {}
+	NetworkFrame(string dst, string body) : NetworkFrame(dst, "CONTENT", body) {}
+	NetworkFrame(string body) : NetworkFrame(broadcastaddr, body) {}
+	NetworkFrame() : NetworkFrame("") {}
+	NetworkFrame& operator=(const NetworkFrame& rhs) {
 		src = rhs.src;
 		seq = rhs.seq;
 		dst = rhs.dst;
@@ -114,130 +131,161 @@ struct NetFrame {
 	}
 };
 
-int sequence_number;
+queue<string> * application_recv_queue;
+
 set<string> * neighbours;
 map<string, set<string>> * routes;
-queue<NetFrame> * transmit_queue;
-map<int, NetFrame> * sent_messages;
-queue<pair<CnetTime, int>> * sent_time;
+
+queue<NetworkFrame> * network_send_queue;
+map<int, NetworkFrame> * network_waiting;
+queue<pair<CnetTime, int>> * network_sent_time;
 map<int, string> * route_used;
-queue<string> * datalink_queue;
-queue<string> * network_queue;
+queue<string> * network_recv_queue;
 
-EVENT_HANDLER(transmit) {
-	if (transmit_queue->empty()) return;
+queue<DataLinkFrame> * datalink_send_queue;
+map<int, DataLinkFrame> * datalink_waiting;
+queue<pair<CnetTime, int>> * datalink_sent_time;
 
-	NetFrame msg = transmit_queue->front();
-	transmit_queue->pop();
-	DataFrame frame;
-	if (msg.dst != broadnicaddr && (routes->count(msg.dst) == 0 || routes->at(msg.dst).empty())) {
-		transmit_queue->push(msg);
-		if (neighbours->size() == 0) {
-			NetFrame nfr(broadnicaddr, "SOUND_OFF", "");
-			frame = DataFrame(nfr.encode());
-			CNET_start_timer(EV_TRANSMIT, 1000, data);	// Schedule retransmission attempt
-		} else {
-			if (routes->count(msg.dst) == 0)
-				routes->emplace(msg.dst, *neighbours);
-			else
-				routes->at(msg.dst) = *neighbours;
-			NetFrame nfr(broadnicaddr, "FULL_REVERSAL", msg.dst);
-			frame = DataFrame(nfr.encode());
-			CNET_start_timer(EV_TRANSMIT, 10000, data);	// Schedule retransmission attempt
-		}
-	} else {
-		if (msg.dst == broadnicaddr || routes->at(msg.dst).count(msg.dst))
-			frame = DataFrame(msg.dst, msg.encode());
-		else
-			frame = DataFrame(*(routes->at(msg.dst).begin()), msg.encode());
-		if (msg.src == get_local_nicaddr() && msg.type == "MESSAGE") {
-			sent_messages->emplace(msg.seq, msg);
-			route_used->emplace(msg.seq, frame.dst);
-			sent_time->push(pair<CnetTime, int>(nodeinfo.time_in_usec, msg.seq));
-		}
-		CNET_start_timer(EV_TIMEOUT, ack_timeout, data);
-	}
-	string framestr = frame.encode();
-	size_t len = framestr.size();
-	CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
+void network_send_enqueue(NetworkFrame nfr) {
+	network_send_queue->push(nfr);
+	CNET_start_timer(EV_NETWORKSEND, 1, 0);
 }
 
-EVENT_HANDLER(timeout) {
-	while (!(sent_time->empty()) && sent_time->front().first + ack_timeout <= nodeinfo.time_in_usec) {
-		int seq = sent_time->front().second;
-		sent_time->pop();
-		if (sent_messages->count(seq)) {
-			NetFrame msg = sent_messages->at(seq);
-			sent_messages->erase(seq);
-			transmit_queue->push(msg);
-			CNET_start_timer(EV_TRANSMIT, 1, data);
-			routes->at(msg.dst).erase(route_used->at(seq));
+void datalink_send_enqueue(DataLinkFrame dfr) {
+	datalink_send_queue->push(dfr);
+	CNET_start_timer(EV_DATALINKSEND, 1, 0);
+}
+
+void network_recv_enqueue(string str) {
+	network_recv_queue->push(str);
+	CNET_start_timer(EV_DATALINKREADY, 1, 0);
+}
+
+void application_recv_enqueue(string str) {
+	application_recv_queue->push(str);
+	CNET_start_timer(EV_NETWORKREADY, 1, 0);
+}
+
+EVENT_HANDLER(network_send) {
+	if (network_send_queue->empty()) return;
+
+	NetworkFrame nfr = network_send_queue->front();
+	network_send_queue->pop();
+	if (nfr.dst != broadcastaddr && (routes->count(nfr.dst) == 0 || routes->at(nfr.dst).empty())) {	// No route to host
+		network_send_queue->push(nfr);	// Requeue frame for retransmission
+		CNET_start_timer(EV_NETWORKSEND, 10000, data);	// Schedule retransmission attempt
+		if (neighbours->size() == 0) {	// If we are not currently aware of any neighbours, poll for them
+			datalink_send_enqueue(DataLinkFrame(broadcastaddr, "SOUND_OFF", ""));
+		} else {	// Perform a full reversal
+			if (routes->count(nfr.dst) == 0)
+				routes->emplace(nfr.dst, *neighbours);
+			else
+				routes->at(nfr.dst) = *neighbours;
+			datalink_send_enqueue(DataLinkFrame(broadcastaddr, "FULL_REVERSAL", nfr.dst));
+		}
+	} else {
+		DataLinkFrame dfr;
+		if (nfr.dst == broadcastaddr || routes->at(nfr.dst).count(nfr.dst))
+			dfr = DataLinkFrame(nfr.dst, nfr.encode());
+		else
+			dfr = DataLinkFrame(*(routes->at(nfr.dst).begin()), nfr.encode());
+		datalink_send_enqueue(dfr);
+		if (nfr.src == get_local_nicaddr() && nfr.dst != broadcastaddr && nfr.type == "CONTENT") {
+			network_waiting->emplace(nfr.seq, nfr);
+			route_used->emplace(nfr.seq, dfr.dst);
+			network_sent_time->push(pair<CnetTime, int>(nodeinfo.time_in_usec, nfr.seq));
+			CNET_start_timer(EV_NETWORKTIMEOUT, network_acktime, data);
+		}
+	}
+}
+
+EVENT_HANDLER(network_timeout) {
+	while (!(network_sent_time->empty()) && network_sent_time->front().first + network_acktime <= nodeinfo.time_in_usec) {
+		int seq = network_sent_time->front().second;
+		network_sent_time->pop();
+		if (network_waiting->count(seq)) {
+			NetworkFrame nfr = network_waiting->at(seq);
+			network_waiting->erase(seq);
+			routes->at(nfr.dst).erase(route_used->at(seq));
 			route_used->erase(seq);
+			application_recv_enqueue("NETWORK LAYER TIMEOUT: " + nfr.body);
+		}
+	}
+}
+
+EVENT_HANDLER(datalink_send) {
+	if (datalink_send_queue->empty()) return;
+
+	DataLinkFrame dfr = datalink_send_queue->front();
+	datalink_send_queue->pop();
+	if (dfr.dst != broadcastaddr && dfr.type == "CONTENT") {
+		datalink_waiting->emplace(dfr.seq, dfr);
+		datalink_sent_time->push(pair<CnetTime, int>(nodeinfo.time_in_usec, dfr.seq));
+		CNET_start_timer(EV_DATALINKTIMEOUT, datalink_acktime, data);
+	}
+	string dfrstr = dfr.encode();
+	size_t len = dfrstr.size();
+	CHECK(CNET_write_physical_reliable(1, (void*) dfrstr.data(), &len));
+	cout << "\t" << nodeinfo.nodenumber << " Transmitting: " << dfrstr << endl;
+}
+
+EVENT_HANDLER(datalink_timeout) {
+	while (!(datalink_sent_time->empty()) && datalink_sent_time->front().first + datalink_acktime <= nodeinfo.time_in_usec) {
+		int seq = datalink_sent_time->front().second;
+		datalink_sent_time->pop();
+		if (datalink_waiting->count(seq)) {
+			DataLinkFrame dfr = datalink_waiting->at(seq);
+			datalink_waiting->erase(seq);
+			neighbours->erase(dfr.dst);
+			for (auto & kv : *routes) {
+				kv.second.erase(dfr.dst);
+			}
+			NetworkFrame nfr;
+			nfr.decode(dfr.body);
+			network_send_enqueue(nfr);
 		}
 	}
 }
 
 EVENT_HANDLER(network_ready) {
-	string message = network_queue->front();
-	network_queue->pop();
+	string message = application_recv_queue->front();
+	application_recv_queue->pop();
 	cout << nodeinfo.nodenumber << ": RECEIVED MESSAGE: " << message << endl;
 }
 
 EVENT_HANDLER(datalink_ready) {
-	string dframestr = datalink_queue->front();
-	datalink_queue->pop();
-	NetFrame nfr;
-	nfr.decode(dframestr);
+	string dfrstr = network_recv_queue->front();
+	network_recv_queue->pop();
+	NetworkFrame nfr;
+	nfr.decode(dfrstr);
 	--nfr.hops;
-	if (nfr.dst == broadnicaddr || nfr.dst == get_local_nicaddr()) {
+	if (nfr.dst == broadcastaddr || nfr.dst == get_local_nicaddr()) {
 		if (nfr.type == "ACK") {
 			cout << nodeinfo.nodenumber << ": RECEIVED ACK" << endl;
-			sent_messages->erase(nfr.seq);
+			unsigned int seq;
+			istringstream(nfr.body) >> seq;
+			network_waiting->erase(seq);
 		} else if (nfr.type == "NACK") {
-			if (sent_messages->count(nfr.seq)) {
-				routes->at(sent_messages->at(nfr.seq).dst).erase(route_used->at(nfr.seq));
-				route_used->erase(nfr.seq);
-				NetFrame msg = sent_messages->at(nfr.seq);
-				msg.seq = sequence_number++;
-				transmit_queue->push(msg);
-				sent_messages->erase(nfr.seq);
+			unsigned int seq;
+			istringstream(nfr.body) >> seq;
+			if (network_waiting->count(seq)) {
+				nfr = network_waiting->at(seq);
+				network_waiting->erase(seq);
+				routes->at(nfr.dst).erase(route_used->at(seq));
+				route_used->erase(seq);
+				application_recv_enqueue("RECEIVED NACK: " + nfr.body);
 			}
-		} else if (nfr.type == "FULL_REVERSAL") {
-			if (routes->count(nfr.body))
-				routes->at(nfr.body).erase(nfr.src);
-			if (nfr.body != get_local_nicaddr() && (routes->count(nfr.body) == 0 || routes->at(nfr.body).empty())) {
-				NetFrame response = NetFrame(broadnicaddr, "FULL_REVERSAL", nfr.body);
-				DataFrame frame(response.encode());
-				string framestr = frame.encode();
-				size_t len = framestr.size();
-				CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
-			}
-		} else if (nfr.type == "SOUND_OFF") {
-			NetFrame response = NetFrame(broadnicaddr, "ONE_TWO", "");
-			DataFrame frame(response.encode());
-			string framestr = frame.encode();
-			size_t len = framestr.size();
-			CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
-		} else if (nfr.type == "MESSAGE") {
-			network_queue->push(nfr.body);
-			CNET_start_timer(EV_NETWORKREADY, 1, data);
-			NetFrame ack(nfr.src, "ACK", "");
-			ack.seq = nfr.seq;
-			transmit_queue->push(ack);
-			CNET_start_timer(EV_TRANSMIT, 1, data);
+		} else if (nfr.type == "CONTENT") {
+			application_recv_enqueue(nfr.body);
+			network_send_enqueue(NetworkFrame(nfr.src, "ACK", to_string(nfr.seq)));
 		}
 	} else {
 		if (nfr.hops > 0) {
-			nfr.body += ", " + to_string(nodeinfo.nodenumber);
-			transmit_queue->push(nfr);
-			CNET_start_timer(EV_TRANSMIT, 1, data);
+			if (nfr.type == "CONTENT")
+				nfr.body += ", " + to_string(nodeinfo.nodenumber);
+			network_send_enqueue(nfr);
 		} else {
-			NetFrame nack(nfr.src, "NACK", "");
-			nack.seq = nfr.seq;
-			DataFrame frame(nack.encode());
-			string framestr = frame.encode();
-			size_t len = framestr.size();
-			CHECK(CNET_write_physical_reliable(1, (void*) framestr.data(), &len));
+			network_send_enqueue(NetworkFrame(nfr.src, "NACK", to_string(nfr.seq)));
 		}
 	}
 }
@@ -250,7 +298,7 @@ EVENT_HANDLER(physical_ready) {
 	CHECK(CNET_read_physical(&link, (void*) buf.data(), &len));
 	buf.resize(len);
 
-	DataFrame dfr;
+	DataLinkFrame dfr;
 	dfr.decode(buf);
 
 	neighbours->insert(dfr.src);
@@ -258,41 +306,74 @@ EVENT_HANDLER(physical_ready) {
 		routes->emplace(dfr.src, set<string>());
 	routes->at(dfr.src).insert(dfr.src);
 
-	if (dfr.dst == broadnicaddr || dfr.dst == get_local_nicaddr()) {
-		datalink_queue->push(dfr.body);
-		CNET_start_timer(EV_DATALINKREADY, 1, data);
+	if (dfr.dst == broadcastaddr || dfr.dst == get_local_nicaddr()) {
+		if (dfr.type == "ACK") {
+			unsigned int seq;
+			istringstream(dfr.body) >> seq;
+			datalink_waiting->erase(seq);
+		} else if (dfr.type == "FULL_REVERSAL") {
+			if (routes->count(dfr.body))
+				routes->at(dfr.body).erase(dfr.src);
+			if (dfr.body != get_local_nicaddr() && (routes->count(dfr.body) == 0 || routes->at(dfr.body).empty())) {
+				if (routes->count(dfr.body) == 0)
+					routes->emplace(dfr.body, *neighbours);
+				else
+					routes->at(dfr.body) = *neighbours;
+				datalink_send_enqueue(DataLinkFrame(broadcastaddr, "FULL_REVERSAL", dfr.body));
+			}
+		} else if (dfr.type == "SOUND_OFF") {
+			datalink_send_enqueue(DataLinkFrame(broadcastaddr, "ONE_TWO", ""));
+		} else if (dfr.type == "CONTENT") {
+			network_recv_enqueue(dfr.body);
+			datalink_send_enqueue(DataLinkFrame(dfr.src, "ACK", to_string(dfr.seq)));
+		}
 	}
+}
+
+EVENT_HANDLER(heartbeat) {
+	datalink_send_enqueue(DataLinkFrame(broadcastaddr, "PULSE", ""));
+	CNET_start_timer(EV_HEARTBEAT, 10000000, data);
 }
 
 int message_number = 0;
 EVENT_HANDLER(testmsg) {
-	NetFrame msg("01:00:00:00:00:01", "This is test message " + to_string(++message_number) + " from 2 to 0");
-	msg.seq = sequence_number++;
-	transmit_queue->push(msg);
-	CNET_start_timer(EV_TRANSMIT, 1, data);
+	network_send_enqueue(NetworkFrame("01:00:00:00:00:01", "This is test message " + to_string(++message_number) + " to 0 from 2"));
 	CNET_start_timer(EV_TESTMSG, 1000000, data);
 }
 
 EVENT_HANDLER(reboot_node) {
-	sequence_number = 1;
+	datalink_sequence_number = 0;
+	network_sequence_number = 0;
+
+	application_recv_queue = new queue<string>;
+
 	neighbours = new set<string>;
 	routes = new map<string, set<string>>;
-	transmit_queue = new queue<NetFrame>;
-	sent_messages = new map<int, NetFrame>;
-	sent_time = new queue<pair<CnetTime, int>>;
+
+	network_send_queue = new queue<NetworkFrame>;
+	network_waiting = new map<int, NetworkFrame>;
+	network_sent_time = new queue<pair<CnetTime, int>>;
 	route_used = new map<int, string>;
-	datalink_queue = new queue<string>;
-	network_queue = new queue<string>;
+	network_recv_queue = new queue<string>;
+
+	datalink_send_queue = new queue<DataLinkFrame>;
+	datalink_waiting = new map<int, DataLinkFrame>;
+	datalink_sent_time = new queue<pair<CnetTime, int>>;
 
 	CNET_check_version(CNET_VERSION);
 	CNET_srand(nodeinfo.time_of_day.sec + nodeinfo.nodenumber);
 
-	CHECK(CNET_set_handler(EV_PHYSICALREADY, physical_ready, 0));
-	CHECK(CNET_set_handler(EV_DATALINKREADY, datalink_ready, 0));
-	CHECK(CNET_set_handler(EV_NETWORKREADY, network_ready, 0));
-	CHECK(CNET_set_handler(EV_TRANSMIT, transmit, 0));
-	CHECK(CNET_set_handler(EV_TIMEOUT, timeout, 0));
 	CHECK(CNET_set_handler(EV_TESTMSG, testmsg, 0));
+	CHECK(CNET_set_handler(EV_HEARTBEAT, heartbeat, 0));
+	CHECK(CNET_set_handler(EV_NETWORKSEND, network_send, 0));
+	CHECK(CNET_set_handler(EV_NETWORKTIMEOUT, network_timeout, 0));
+	CHECK(CNET_set_handler(EV_DATALINKSEND, datalink_send, 0));
+	CHECK(CNET_set_handler(EV_DATALINKTIMEOUT, datalink_timeout, 0));
+	CHECK(CNET_set_handler(EV_NETWORKREADY, network_ready, 0));
+	CHECK(CNET_set_handler(EV_DATALINKREADY, datalink_ready, 0));
+	CHECK(CNET_set_handler(EV_PHYSICALREADY, physical_ready, 0));
+
+	//CNET_start_timer(EV_HEARTBEAT, 10000000, 0);
 
 	if(nodeinfo.nodetype == NT_MOBILE && nodeinfo.nodenumber == 2) {
 		init_randomwalk(EV_WALKING);
