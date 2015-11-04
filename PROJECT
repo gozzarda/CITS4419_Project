@@ -8,9 +8,19 @@ icontitle	= "%d"
 drawlinks	= true
 mapgrid		= 50
 
-wlan-probframecorrupt = 3;
-
 mobile PDAa { wlan { } }
 mobile PDAb { wlan { } }
 mobile PDAc { wlan { } }
 mobile PDAd { wlan { } }
+mobile PDAe { wlan { } }
+mobile PDAf { wlan { } }
+mobile PDAg { wlan { } }
+mobile PDAh { wlan { } }
+mobile PDAi { wlan { } }
+mobile PDAj { wlan { } }
+mobile PDAk { wlan { } }
+mobile PDAl { wlan { } }
+mobile PDAm { wlan { } }
+mobile PDAn { wlan { } }
+mobile PDAo { wlan { } }
+mobile PDAp { wlan { } }

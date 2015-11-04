@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <sstream>
 #include <cstdint>
@@ -21,7 +22,7 @@ using namespace std;
 #define	EV_WALKING			EV_TIMER9
 
 const string broadcastaddr = "ff:ff:ff:ff:ff:ff";
-const CnetTime datalink_acktime = 1000;
+const CnetTime datalink_acktime = 10000;
 const CnetTime network_acktime = 1000000;
 
 string get_local_nicaddr() {
@@ -281,8 +282,8 @@ EVENT_HANDLER(datalink_ready) {
 		}
 	} else {
 		if (nfr.hops > 0) {
-			if (nfr.type == "CONTENT")
-				nfr.body += ", " + to_string(nodeinfo.nodenumber);
+			//if (nfr.type == "CONTENT")
+			//	nfr.body += ", " + to_string(nodeinfo.nodenumber);
 			network_send_enqueue(nfr);
 		} else {
 			network_send_enqueue(NetworkFrame(nfr.src, "NACK", to_string(nfr.seq)));
@@ -320,6 +321,8 @@ EVENT_HANDLER(physical_ready) {
 				else
 					routes->at(dfr.body) = *neighbours;
 				datalink_send_enqueue(DataLinkFrame(broadcastaddr, "FULL_REVERSAL", dfr.body));
+			} else if (dfr.body == get_local_nicaddr()) {
+				datalink_send_enqueue(DataLinkFrame(broadcastaddr, "PRESENT", ""));
 			}
 		} else if (dfr.type == "SOUND_OFF") {
 			datalink_send_enqueue(DataLinkFrame(broadcastaddr, "ONE_TWO", ""));
@@ -337,7 +340,7 @@ EVENT_HANDLER(heartbeat) {
 
 int message_number = 0;
 EVENT_HANDLER(testmsg) {
-	network_send_enqueue(NetworkFrame("01:00:00:00:00:01", "This is test message " + to_string(++message_number) + " to 0 from 2"));
+	network_send_enqueue(NetworkFrame("01:00:00:00:00:01", "This is test message " + to_string(++message_number) + " to 0 from " + to_string(nodeinfo.nodenumber)));
 	CNET_start_timer(EV_TESTMSG, 1000000, data);
 }
 
@@ -375,7 +378,7 @@ EVENT_HANDLER(reboot_node) {
 
 	//CNET_start_timer(EV_HEARTBEAT, 10000000, 0);
 
-	if(nodeinfo.nodetype == NT_MOBILE && nodeinfo.nodenumber == 2) {
+	if(nodeinfo.nodetype == NT_MOBILE) {
 		init_randomwalk(EV_WALKING);
 		start_walking();
 	}
